@@ -1,5 +1,37 @@
 ```python
 
+
+def build_judge(**kwargs):
+    from ...api import OpenAIWrapper, SiliconFlowAPI
+    model = kwargs.pop('model', None)
+    kwargs.pop('nproc', None)
+    load_env()
+    LOCAL_LLM = os.environ.get('LOCAL_LLM', None)
+    if LOCAL_LLM is None:
+        model_map = {
+            'gpt-4-turbo': 'gpt-4-1106-preview',
+            'gpt-4-0613': 'gpt-4-0613',
+            'gpt-4-0125': 'gpt-4-0125-preview',
+            'gpt-4-0409': 'gpt-4-turbo-2024-04-09',
+            'chatgpt-1106': 'gpt-3.5-turbo-1106',
+            'chatgpt-0125': 'gpt-3.5-turbo-0125',
+            'gpt-4o': 'gpt-4o-2024-05-13',
+            'gpt-4o-0806': 'gpt-4o-2024-08-06',
+            'gpt-4o-mini': 'gpt-4o-mini-2024-07-18',
+            'qwen-7b': 'Qwen/Qwen2.5-7B-Instruct',
+            'qwen-72b': 'Qwen/Qwen2.5-72B-Instruct',
+            'deepseek': 'deepseek-ai/DeepSeek-V2.5',
+        }
+        model_version = model_map[model]
+    else:
+        model_version = LOCAL_LLM
+
+    if model in ['qwen-7b', 'qwen-72b', 'deepseek']:
+        model = SiliconFlowAPI(model_version, **kwargs)
+    else:
+        model = OpenAIWrapper(model_version, **kwargs)
+    return model
+
 import os
 import re
 import tempfile
@@ -102,44 +134,6 @@ class ImageVQADataset(ImageBaseDataset):
         return ret
 
 
-class VizWiz(ImageBaseDataset):
-    TYPE = 'VQA'
-    DATASET_URL = {
-        'VizWiz': 'https://opencompass.openxlab.space/utils/VLMEval/VizWiz.tsv'
-    }
-    DATASET_MD5 = {
-        'VizWiz': 'fa4ac4164467563ed2fac6eac6631bd0'
-    }
-
-    @classmethod
-    def evaluate(self, eval_file, **judge_kwargs):
-        from .utils.vqa_eval import hit_calculate, process_line
-
-        suffix = eval_file.split('.')[-1]
-        result_file = eval_file.replace(f'.{suffix}', '_acc.csv')
-
-        if not osp.exists(result_file):
-            data = load(eval_file)
-            assert 'answers' in data and 'prediction' in data
-            data['prediction'] = [str(x) for x in data['prediction']]
-            data['answer'] = [str(x) for x in data['answers']]
-
-            lt = len(data)
-            pool = mp.Pool(16)
-            lines = [data.iloc[i] for i in range(lt)]
-            res = pool.map(process_line, lines)
-
-            hit = hit_calculate(res, 'VizWiz')
-            ret = dict()
-
-            ret['Overall'] = np.mean(hit) * 100
-            ret = d2df(ret)
-            ret.round(2)
-
-            dump(ret, result_file)
-
-        retz = pd.read_csv(result_file)
-        return retz
 
 
 class OCRBench(ImageBaseDataset):
@@ -370,69 +364,6 @@ class MathVerse(ImageBaseDataset):
         return score
 
 
-class MathVision(ImageBaseDataset):
-    TYPE = 'VQA'
-    DATASET_URL = {
-        'MathVision': 'https://opencompass.openxlab.space/utils/VLMEval/MathVision.tsv',
-        'MathVision_MINI': 'https://opencompass.openxlab.space/utils/VLMEval/MathVision_MINI.tsv'
-    }
-    DATASET_MD5 = {
-        'MathVision': '93f6de14f7916e598aa1b7165589831e',
-        'MathVision_MINI': '060fe4fa5d868987ce179307bd5f8a33'
-    }
-
-    # It returns a DataFrame
-    @classmethod
-    def evaluate(self, eval_file, **judge_kwargs):
-        from .utils.mathv import MATH_V_auxeval, MATH_V_acc
-
-        if 'model' in judge_kwargs:
-            model = judge_kwargs['model']
-        else:
-            model = os.path.basename(os.environ.get('LOCAL_LLM'))
-        suffix = eval_file.split('.')[-1]
-        storage = eval_file.replace(f'.{suffix}', f'_{model}.xlsx')
-        tmp_file = eval_file.replace(f'.{suffix}', f'_{model}.pkl')
-        nproc = judge_kwargs.pop('nproc', 4)
-
-        if not osp.exists(storage):
-            data = load(eval_file)
-            model = build_judge(max_tokens=128, **judge_kwargs)
-            assert model.working(), ('MATH-Vision evaluation requires a working OPENAI API\n' + DEBUG_MESSAGE)
-            lt = len(data)
-            lines = [data.iloc[i] for i in range(lt)]
-            tups = [(model, line) for line in lines]
-            indices = [line['index'] for line in lines]
-
-            ans = {}
-            if osp.exists(tmp_file):
-                ans = load(tmp_file)
-            tups = [x for x, i in zip(tups, indices) if i not in ans]
-            indices = [i for i in indices if i not in ans]
-
-            if len(indices):
-                new_results = track_progress_rich(
-                    MATH_V_auxeval,
-                    tups,
-                    nproc=nproc,
-                    chunksize=nproc,
-                    keys=indices,
-                    save=tmp_file,
-                )
-                ans = load(tmp_file)
-                for k, v in zip(indices, new_results):
-                    assert k in ans
-                    assert ans[k]['log'] == v['log'] and ans[k]['res'] == v['res']
-
-            data['res'] = [ans[idx]['res'] for idx in data['index']]
-            data['log'] = [ans[idx]['log'] for idx in data['index']]
-            dump(data, storage)
-
-        score = MATH_V_acc(storage)
-        score_pth = storage.replace('.xlsx', '_score.csv')
-        dump(score, score_pth)
-        return score
-
 
 class OlympiadBench(ImageBaseDataset):
     TYPE = 'VQA_ex_prompt'
@@ -647,46 +578,6 @@ class OlympiadBench(ImageBaseDataset):
         accdz = pd.read_csv(score_file)
         return accdz
 
-
-class LLaVABench(ImageBaseDataset):
-    TYPE = 'VQA'
-    DATASET_URL = {'LLaVABench': 'https://opencompass.openxlab.space/utils/VLMEval/LLaVABench.tsv'}
-    DATASET_MD5 = {'LLaVABench': 'd382a093f749a697820d3dadd61c8428'}
-
-    # It returns a DataFrame
-    @classmethod
-    def evaluate(self, eval_file, **judge_kwargs):
-        from .utils.llavabench import (
-            build_prompt,
-            LLaVABench_atomeval,
-            LLaVABench_score,
-        )
-
-        suffix = '.' + eval_file.split('.')[-1]
-        record_file = eval_file.replace(suffix, '_openai_result' + suffix)
-        score_file = eval_file.replace(suffix, '_score.csv')
-        nproc = judge_kwargs.pop('nproc', 4)
-        system_prompt = 'You are a helpful and precise assistant for checking the quality of the answer.'
-
-        if not osp.exists(record_file):
-            data = load(eval_file)
-            lines = [data.iloc[i] for i in range(len(data))]
-            model = build_judge(temperature=0.2, system_prompt=system_prompt, **judge_kwargs)
-            assert model.working(), ('LLaVABench evaluation requires a working OPENAI API\n' + DEBUG_MESSAGE)
-
-            prompts = [build_prompt(line) for line in lines]
-            tups = [(model, prompt) for prompt in prompts]
-            scores = track_progress_rich(LLaVABench_atomeval, tups, nproc=nproc, chunksize=nproc)
-            data['gpt4_score'] = [x[0] for x in scores]
-            data['score'] = [x[1] for x in scores]
-            dump(data, record_file)
-
-        data = load(record_file)
-        ret = LLaVABench_score(data).round(1)
-        dump(ret, score_file)
-        return ret
-
-
 class MMVet(ImageBaseDataset):
     TYPE = 'VQA'
     DATASET_URL = {
@@ -741,102 +632,6 @@ class MMVet(ImageBaseDataset):
         dump(score, score_pth)
         dump(score_fine, score_fine_pth)
         return score
-
-
-class MTVQADataset(ImageBaseDataset):
-    TYPE = 'VQA'
-    DATASET_URL = {'MTVQA_TEST': 'https://opencompass.openxlab.space/utils/VLMEval/MTVQA_TEST.tsv'}
-    DATASET_MD5 = {'MTVQA_TEST': 'd87c17dbab934b7cd89c0a3c1c5657f4'}
-
-    @classmethod
-    def evaluate(self, eval_file, **judge_kwargs):
-        data = load(eval_file)
-        assert 'answer' in data and 'prediction' in data and 'category' in data
-        data['prediction'] = [str(x) for x in data['prediction']]
-        data['answer'] = [str(x) for x in data['answer']]
-        if 'split' in data:
-            assert np.all([x.lower() == 'test' for x in data['split']]), 'We only support MTVQA_TEST for now. '
-        lt = len(data)
-        category_scores = defaultdict(list)
-        for i in range(lt):
-            line = data.iloc[i]
-            ans = line['answer'].strip().lower().replace('.', '')
-            pred = line['prediction'].strip().lower().replace('.', '')
-            cate = line['category']
-            score = 1.0 if ans in pred else 0.0
-            category_scores[cate].append(score)
-            category_scores['Average'].append(score)
-        # Calculate the average score for each category, the score is normalized to [0, 100]
-        category_averages = {category: np.mean(scores) * 100 for category, scores in category_scores.items()}
-
-        suffix = eval_file.split('.')[-1]
-        result_file = eval_file.replace(f'.{suffix}', '_acc.json')
-        dump(category_averages, result_file)
-
-        return category_averages
-
-    # MT-VQA adopts a custom prompt
-    def build_prompt(self, line):
-        msgs = super().build_prompt(line)
-        assert sum([x['type'] == 'text' for x in msgs]) == 1
-        for item in msgs:
-            if item['type'] == 'text':
-                item['value'] += '\nAnswer the question using a word or phrase in the language of the question.'
-        return msgs
-
-
-class TableVQABench(ImageBaseDataset):
-    TYPE = 'VQA'
-    DATASET_URL = {
-        'TableVQABench': 'https://pai-aigc-photog.oss-cn-hangzhou.aliyuncs.com/mentor-vil/datasets/tablevqa-bench.tsv'
-    }
-    DATASET_MD5 = {'TableVQABench': '2550adc61bdc82d8e62f3b003de7c62d'}
-
-    from .utils.tablevqabench import FINTABNETQA_PROMPT, VTABFACT_PROMPT, VWTQ_PROMPT
-
-    # It returns a DataFrame
-    @classmethod
-    def evaluate(self, eval_file, **judge_kwargs):
-        import pandas as pd
-        from .utils.tablevqabench import evaluate_fintabnet, evaluate_tabfact, evaluate_wtq
-
-        data = load(eval_file)
-        assert 'answer' in data and 'prediction' in data
-
-        data['prediction'] = data['prediction'].str.replace('^Answer: ', '', regex=True)
-        data_group = dict(tuple(data.groupby('split')))
-        eval_result = {'split': [], 'average_scores': []}
-        for split in ['fintabnetqa', 'vtabfact', 'vwtq', 'vwtq_syn']:
-            data_split = data_group[split].to_dict(orient='records')
-            if split == 'fintabnetqa':
-                split_eval_meta = evaluate_fintabnet(data_split, ['accuracy'])
-            elif split == 'vtabfact':
-                split_eval_meta = evaluate_tabfact(data_split, ['accuracy'])
-            elif split == 'vwtq' or split == 'vwtq_syn':
-                split_eval_meta = evaluate_wtq(data_split, ['accuracy'])
-            eval_result['split'].append(split)
-            eval_result['average_scores'].append(split_eval_meta['average_scores'])
-
-        suffix = eval_file.split('.')[-1]
-        result_file = eval_file.replace(f'.{suffix}', '_acc.csv')
-        eval_result = pd.DataFrame(eval_result)
-        dump(eval_result, result_file)
-
-        return eval_result
-
-    # TableVQABench adopts a custom prompt
-    def build_prompt(self, line):
-        msgs = super().build_prompt(line)
-        assert sum([x['type'] == 'text' for x in msgs]) == 1
-        for item in msgs:
-            if item['type'] == 'text':
-                if line['split'] == 'fintabnetqa':
-                    item['value'] = self.FINTABNETQA_PROMPT.format_map({'question': item['value']})
-                elif line['split'] == 'vtabfact':
-                    item['value'] = self.VTABFACT_PROMPT.format_map({'question': item['value']})
-                elif line['split'] == 'vwtq_syn' or line['split'] == 'vwtq':
-                    item['value'] = self.VWTQ_PROMPT.format_map({'question': item['value']})
-        return msgs
 
 
 class CustomVQADataset(ImageBaseDataset):

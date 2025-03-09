@@ -240,7 +240,10 @@ def build_dataset(dataset_name, **kwargs):
             return supported_video_datasets[dataset_name](**kwargs)
         elif dataset_name in cls.supported_datasets():
             return cls(dataset=dataset_name, **kwargs)
-
+#---------------------
+ def supported_datasets(cls):
+        return list(cls.DATASET_SETS)
+#------------------
     warnings.warn(f'Dataset {dataset_name} is not officially supported. ')
 
     data_file = osp.join(LMUDataRoot(), f'{dataset_name}.tsv')
@@ -263,6 +266,19 @@ def build_dataset(dataset_name, **kwargs):
     else:
         warnings.warn(f'Will assume unsupported dataset {dataset_name} as a Custom VQA dataset. ')
         return CustomVQADataset(dataset=dataset_name, **kwargs)
+IMAGE_DATASET = [
+    ImageCaptionDataset, ImageYORNDataset, ImageMCQDataset, ImageVQADataset, MathVision,
+    MMMUDataset, OCRBench, MathVista, LLaVABench, MMVet, MTVQADataset, TableVQABench,
+    MMLongBench, VCRDataset, MMDUDataset, DUDE, SlideVQA, MUIRDataset, CCOCRDataset,
+    GMAIMMBenchDataset, MMERealWorld, HRBenchDataset, CRPE, MathVerse, NaturalBenchDataset,
+    MIABench, OlympiadBench, WildVision, MMMath, QSpatial, Dynamath, MMGenBench, VizWiz, MMNIAH,
+    CMMMU, VLRewardBench, WeMath, LogicVista, MMMUProDataset, CreationMMBenchDataset,
+    ImageShortQADataset, MMAlignBench, OmniDocBench
+]
+
+DATASET_COLLECTION = [ConcatDataset, ConcatVideoDataset]
+
+DATASET_CLASSES = IMAGE_DATASET + VIDEO_DATASET + TEXT_DATASET + CUSTOM_DATASET + DATASET_COLLECTION
 #---------------------------
                 # Handling Multi-Turn Dataset
                 if dataset.TYPE == 'MT':

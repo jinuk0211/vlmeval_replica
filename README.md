@@ -1238,10 +1238,37 @@ IMAGE_DATASET = [
     CMMMU, VLRewardBench, WeMath, LogicVista, MMMUProDataset, CreationMMBenchDataset,
     ImageShortQADataset, MMAlignBench, OmniDocBench
 ]
-
 DATASET_COLLECTION = [ConcatDataset, ConcatVideoDataset]
+DATASET_CLASSES = IMAGE_DATASET + VIDEO_DATASET + TEXT_DATASET + CUSTOM_DATASET + DATASET_COLLECTIO
+class CustomMCQDataset(ImageMCQDataset): #image_mcq.py class
 
-DATASET_CLASSES = IMAGE_DATASET + VIDEO_DATASET + TEXT_DATASET + CUSTOM_DATASET + DATASET_COLLECTION
+    def load_data(self, dataset):
+        data_path = osp.join(LMUDataRoot(), f'{dataset}.tsv')
+
+        if file_size(data_path, 'GB') > 1:
+            local_path = data_path.replace('.tsv', '_local.tsv')
+            if not osp.exists(local_path) or os.environ.get('FORCE_LOCAL', None):
+                from ..tools import LOCALIZE
+                LOCALIZE(data_path, local_path)
+            data_path = local_path
+        return load(data_path)
+class CustomVQADataset(ImageBaseDataset): #imagevqa.py에 잇는 클래스
+    TYPE = 'VQA'
+
+    def load_data(self, dataset):
+        data_path = osp.join(LMUDataRoot(), f'{dataset}.tsv')
+
+        if file_size(data_path, 'GB') > 1:
+            local_path = data_path.replace('.tsv', '_local.tsv')
+            if not osp.exists(local_path) or os.environ.get('FORCE_LOCAL', None):
+                from ..tools import LOCALIZE
+
+                LOCALIZE(data_path, local_path)
+            data_path = local_path
+        return load(data_path)
+
+    def evaluate(self, eval_file, **judge_kwargs):
+        raise NotImplementedError
 #---------------------------
                 # Handling Multi-Turn Dataset
                 if dataset.TYPE == 'MT':
@@ -1335,7 +1362,7 @@ def fetch_aux_files(eval_file):
                         api_nproc=args.api_nproc, # default=4
                         ignore_failed=args.ignore)
 # Ignore: will not rerun failed VLM inference parser.add_argument('--ignore', action='store_true', help='Ignore failed indices. ')
-#---------------------------------
+#--------------------------------- VLMEvalKit/vlmeval/inference.py
 def infer_data_job(model, work_dir, model_name, dataset, verbose=False, api_nproc=4, ignore_failed=False):
     rank, world_size = get_rank_and_world_size()
     dataset_name = dataset.dataset_name
@@ -1378,6 +1405,78 @@ def infer_data_job(model, work_dir, model_name, dataset, verbose=False, api_npro
             os.remove(tmpl.format(i))
     if world_size > 1:
         dist.barrier()
+    return model
+def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, api_nproc=4):
+    dataset_name = dataset.dataset_name
+    prev_file = f'{work_dir}/{model_name}_{dataset_name}_PREV.pkl'
+    res = load(prev_file) if osp.exists(prev_file) else {}
+    if osp.exists(out_file):
+        res.update(load(out_file))
+
+    rank, world_size = get_rank_and_world_size()
+    sheet_indices = list(range(rank, len(dataset), world_size))
+    lt = len(sheet_indices)
+    data = dataset.data.iloc[sheet_indices]
+    data_indices = [i for i in data['index']]
+
+    # If finished, will exit without building the model
+    all_finished = True
+    for i in range(lt):
+        idx = data.iloc[i]['index']
+        if idx not in res:
+            all_finished = False
+    if all_finished:
+        res = {k: res[k] for k in data_indices}
+        dump(res, out_file)
+        return
+
+    # Data need to be inferred
+    data = data[~data['index'].isin(res)]
+    lt = len(data)
+
+    model = supported_VLM[model_name]() if isinstance(model, str) else model
+
+    is_api = getattr(model, 'is_api', False)
+    if is_api:
+        lt, indices = len(data), list(data['index'])
+        supp = infer_data_api(
+            model=model,
+            work_dir=work_dir,
+            model_name=model_name,
+            dataset=dataset,
+            index_set=set(indices),
+            api_nproc=api_nproc)
+        for idx in indices:
+            assert idx in supp
+        res.update(supp)
+        res = {k: res[k] for k in data_indices}
+        dump(res, out_file)
+        return model
+    else:
+        model.set_dump_image(dataset.dump_image)
+
+    for i in tqdm(range(lt)):
+        idx = data.iloc[i]['index']
+        if idx in res:
+            continue
+
+        if hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
+            struct = model.build_prompt(data.iloc[i], dataset=dataset_name)
+        else:
+            struct = dataset.build_prompt(data.iloc[i])
+
+        response = model.generate(message=struct, dataset=dataset_name)
+        torch.cuda.empty_cache()
+
+        if verbose:
+            print(response, flush=True)
+
+        res[idx] = response
+        if (i + 1) % 10 == 0:
+            dump(res, out_file)
+
+    res = {k: res[k] for k in data_indices}
+    dump(res, out_file)
     return model
 #---------------------------
                 # Set the judge kwargs first before evaluation or dumping

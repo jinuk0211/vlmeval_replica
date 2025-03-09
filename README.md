@@ -12,7 +12,7 @@ from vlmeval.dataset import build_dataset
 from vlmeval.inference import infer_data_job
 from vlmeval.inference_video import infer_data_job_video
 from vlmeval.inference_mt import infer_data_job_mt
-from vlmeval.smp import *
+from vlmeval.smp import * #get_rank_and_world_size
 from vlmeval.utils.result_transfer import MMMU_result_transfer, MMTBench_result_transfer
 
 def build_model_from_config(cfg, model_name):
@@ -160,9 +160,14 @@ def main():  #DATA,MODEL,CONFIG는 PARSE_ARG의 디폴트값 없음
     logger = get_logger('RUN')
     rank, world_size = get_rank_and_world_size()
     args = parse_args()
-    use_config, cfg = False, None
+    use_config, cfg = False, None # if args.config is not None: True,load(args.config)지움
     assert len(args.data), '--data should be a list of data files'
-
+#----------
+def get_rank_and_world_size():
+    rank = int(os.environ.get('RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    return rank, world_size
+#------------------`
     if rank == 0:
         if not args.reuse: #reuse 디폴트값 없음
             logger.warning('--reuse is not set, will not reuse previous (before one day) temporary files')
@@ -213,31 +218,21 @@ def main():  #DATA,MODEL,CONFIG는 PARSE_ARG의 디폴트값 없음
 
             try:
                 result_file_base = f'{model_name}_{dataset_name}.xlsx'
+                #if use_config 지움 밑의 내용은 else:의 내용    
+                dataset_kwargs = {}
+                if dataset_name in ['MMLongBench_DOC', 'DUDE', 'DUDE_MINI', 'SLIDEVQA', 'SLIDEVQA_MINI']:
+                    dataset_kwargs['model'] = model_name
 
-                if use_config:
-                    if world_size > 1:
-                        if rank == 0:
-                            dataset = build_dataset_from_config(cfg['data'], dataset_name)
-                        dist.barrier()
-                    dataset = build_dataset_from_config(cfg['data'], dataset_name)
-                    if dataset is None:
-                        logger.error(f'Dataset {dataset_name} is not valid, will be skipped. ')
-                        continue
-                else:
-                    dataset_kwargs = {}
-                    if dataset_name in ['MMLongBench_DOC', 'DUDE', 'DUDE_MINI', 'SLIDEVQA', 'SLIDEVQA_MINI']:
-                        dataset_kwargs['model'] = model_name
+                # If distributed, first build the dataset on the main process for doing preparation works
+                if world_size > 1:
+                    if rank == 0:
+                        dataset = build_dataset(dataset_name, **dataset_kwargs)
+                    dist.barrier()
 
-                    # If distributed, first build the dataset on the main process for doing preparation works
-                    if world_size > 1:
-                        if rank == 0:
-                            dataset = build_dataset(dataset_name, **dataset_kwargs)
-                        dist.barrier()
-
-                    dataset = build_dataset(dataset_name, **dataset_kwargs)
-                    if dataset is None:
-                        logger.error(f'Dataset {dataset_name} is not valid, will be skipped. ')
-                        continue
+                dataset = build_dataset(dataset_name, **dataset_kwargs)
+                if dataset is None:
+                    logger.error(f'Dataset {dataset_name} is not valid, will be skipped. ')
+                    continue
 #--------------------
 def build_dataset(dataset_name, **kwargs):
     for cls in DATASET_CLASSES:
@@ -281,7 +276,7 @@ def build_dataset(dataset_name, **kwargs):
                     prev_pkl_file_list = []
                     for root in prev_pred_roots[::-1]:
                         if osp.exists(osp.join(root, result_file_base)):
-                            if args.reuse_aux:
+                            if args.reuse_aux: #디폴트 True
                                 prev_result_files = fetch_aux_files(osp.join(root, result_file_base))
                             else:
                                 prev_result_files = [osp.join(root, result_file_base)]
@@ -312,7 +307,29 @@ def build_dataset(dataset_name, **kwargs):
                                 logger.info(f'--reuse is set, will reuse the prediction pickle file {fname}.')
                             else:
                                 logger.warning(f'File already exists: {target_path}')
+#----------------------------
+def fetch_aux_files(eval_file): 
+    file_root = osp.dirname(eval_file)
+    file_name = osp.basename(eval_file)
 
+    eval_id = osp.basename(file_root)
+    if eval_id[:3] == 'T20' and eval_id[9:11] == '_G':
+        model_name = osp.basename(osp.dirname(file_root))
+    else:
+        model_name = eval_id
+    
+    dataset_name = osp.splitext(file_name)[0][len(model_name) + 1:]
+    from vlmeval.dataset import SUPPORTED_DATASETS
+    to_handle = []
+    for d in SUPPORTED_DATASETS:
+        if d.startswith(dataset_name) and d != dataset_name:
+            to_handle.append(d)
+    fs = ls(file_root, match=f'{model_name}_{dataset_name}')
+    if len(to_handle):
+        for d in to_handle:
+            fs = [x for x in fs if d not in x]
+    return fs
+#---------------------------
                 if world_size > 1:
                     dist.barrier()
 
@@ -329,32 +346,68 @@ def build_dataset(dataset_name, **kwargs):
                         result_file_name=result_file_base,
                         verbose=args.verbose,
                         api_nproc=args.api_nproc)
-                elif dataset.TYPE == 'MT':
-                    model = infer_data_job_mt(
-                        model,
-                        work_dir=pred_root,
-                        model_name=model_name,
-                        dataset=dataset,
-                        verbose=args.verbose,
-                        api_nproc=args.api_nproc,
-                        ignore_failed=args.ignore)
-                else:
+                else: #mt 데이터 제거함
                     model = infer_data_job(
                         model,
                         work_dir=pred_root,
                         model_name=model_name,
                         dataset=dataset,
                         verbose=args.verbose,
-                        api_nproc=args.api_nproc,
+                        api_nproc=args.api_nproc, # default=4
                         ignore_failed=args.ignore)
+# Ignore: will not rerun failed VLM inference parser.add_argument('--ignore', action='store_true', help='Ignore failed indices. ')
+#---------------------------------
+def infer_data_job(model, work_dir, model_name, dataset, verbose=False, api_nproc=4, ignore_failed=False):
+    rank, world_size = get_rank_and_world_size()
+    dataset_name = dataset.dataset_name
+    result_file = osp.join(work_dir, f'{model_name}_{dataset_name}.xlsx')
 
+    prev_file = f'{work_dir}/{model_name}_{dataset_name}_PREV.pkl'
+    if osp.exists(result_file):
+        if rank == 0:
+            data = load(result_file)
+            results = {k: v for k, v in zip(data['index'], data['prediction'])}
+            if not ignore_failed:
+                results = {k: v for k, v in results.items() if FAIL_MSG not in str(v)}
+            dump(results, prev_file)
+        if world_size > 1:
+            dist.barrier()
+
+    tmpl = osp.join(work_dir, '{}' + f'{world_size}_{dataset_name}.pkl')
+    out_file = tmpl.format(rank)
+
+    model = infer_data(
+        model=model, work_dir=work_dir, model_name=model_name, dataset=dataset,
+        out_file=out_file, verbose=verbose, api_nproc=api_nproc)
+    if world_size > 1:
+        dist.barrier()
+
+    if rank == 0:
+        data_all = {}
+        for i in range(world_size):
+            data_all.update(load(tmpl.format(i)))
+
+        data = dataset.data
+        for x in data['index']:
+            assert x in data_all
+        data['prediction'] = [str(data_all[x]) for x in data['index']]
+        if 'image' in data:
+            data.pop('image')
+
+        dump(data, result_file)
+        for i in range(world_size):
+            os.remove(tmpl.format(i))
+    if world_size > 1:
+        dist.barrier()
+    return model
+#---------------------------
                 # Set the judge kwargs first before evaluation or dumping
 
                 judge_kwargs = {
                     'nproc': args.api_nproc,
                     'verbose': args.verbose,
                     'retry': args.retry if args.retry is not None else 3,
-                    **(json.loads(args.judge_args) if args.judge_args else {}),
+                    **(json.loads(args.judge_args) if args.judge_args else {}), #디폴트 none judge,judge_args 둘다
                 }
 
                 if args.retry is not None:
@@ -396,7 +449,7 @@ def build_dataset(dataset_name, **kwargs):
                         continue
 
                     # Skip the evaluation part if only infer
-                    if args.mode == 'infer':
+                    if args.mode == 'infer': # 디폴트='all', choices=['all', 'infer']
                         continue
 
                     # Skip the evaluation part if the dataset evaluation is not supported or annotations are missing
@@ -424,6 +477,12 @@ def build_dataset(dataset_name, **kwargs):
                     old_proxy = os.environ.get('HTTP_PROXY', '')
                     if eval_proxy is not None:
                         proxy_set(eval_proxy)
+#-----------------
+def proxy_set(s):
+    import os
+    for key in ['http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY']:
+        os.environ[key] = s
+#--------------------
 
                     # Perform the Evaluation
                     eval_results = dataset.evaluate(result_file, **judge_kwargs)

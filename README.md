@@ -6,7 +6,7 @@ import json
 import torch
 import torch.distributed as dist
 
-from vlmeval.config import supported_VLM
+from vlmeval.config import supported_VLM #supported_VLM = {}
 from vlmeval.dataset.video_dataset_config import supported_video_datasets
 from vlmeval.dataset import build_dataset
 from vlmeval.inference import infer_data_job
@@ -156,21 +156,15 @@ You can launch the evaluation by setting either --data and --model or --config.
     return args
 
 
-def main():
+def main():  #DATA,MODEL,CONFIG는 PARSE_ARG의 디폴트값 없음
     logger = get_logger('RUN')
     rank, world_size = get_rank_and_world_size()
     args = parse_args()
     use_config, cfg = False, None
-    if args.config is not None:
-        assert args.data is None and args.model is None, '--data and --model should not be set when using --config'
-        use_config, cfg = True, load(args.config)
-        args.model = list(cfg['model'].keys())
-        args.data = list(cfg['data'].keys())
-    else:
-        assert len(args.data), '--data should be a list of data files'
+    assert len(args.data), '--data should be a list of data files'
 
     if rank == 0:
-        if not args.reuse:
+        if not args.reuse: #reuse 디폴트값 없음
             logger.warning('--reuse is not set, will not reuse previous (before one day) temporary files')
         else:
             logger.warning('--reuse is set, will reuse the latest prediction & temporary pickle files')
@@ -178,11 +172,11 @@ def main():
     if 'MMEVAL_ROOT' in os.environ:
         args.work_dir = os.environ['MMEVAL_ROOT']
 
-    if not use_config:
+    if not use_config: #use_config가 false시 작동
         for k, v in supported_VLM.items():
-            if hasattr(v, 'keywords') and 'retry' in v.keywords and args.retry is not None:
-                v.keywords['retry'] = args.retry
-                supported_VLM[k] = v
+            #if hasattr(v, 'keywords') and 'retry' in v.keywords and args.retry is not None: #args.retry 디폴트 none
+            #    v.keywords['retry'] = args.retry
+            #    supported_VLM[k] = v
             if hasattr(v, 'keywords') and 'verbose' in v.keywords and args.verbose is not None:
                 v.keywords['verbose'] = args.verbose
                 supported_VLM[k] = v
@@ -211,8 +205,7 @@ def main():
         if not osp.exists(pred_root):
             os.makedirs(pred_root, exist_ok=True)
 
-        if use_config:
-            model = build_model_from_config(cfg['model'], model_name)
+ 
 
         for _, dataset_name in enumerate(args.data):
             if world_size > 1:
@@ -245,7 +238,37 @@ def main():
                     if dataset is None:
                         logger.error(f'Dataset {dataset_name} is not valid, will be skipped. ')
                         continue
+#--------------------
+def build_dataset(dataset_name, **kwargs):
+    for cls in DATASET_CLASSES:
+        if dataset_name in supported_video_datasets:
+            return supported_video_datasets[dataset_name](**kwargs)
+        elif dataset_name in cls.supported_datasets():
+            return cls(dataset=dataset_name, **kwargs)
 
+    warnings.warn(f'Dataset {dataset_name} is not officially supported. ')
+
+    data_file = osp.join(LMUDataRoot(), f'{dataset_name}.tsv')
+    if not osp.exists(data_file):
+        warnings.warn(f'Data file {data_file} does not exist. Dataset building failed. ')
+        return None
+
+    data = load(data_file)
+    if 'question' not in [x.lower() for x in data.columns]:
+        warnings.warn(f'Data file {data_file} does not have a `question` column. Dataset building failed. ')
+        return None
+
+    if 'A' in data and 'B' in data:
+        if 'image' in data or 'image_path' in data:
+            warnings.warn(f'Will assume unsupported dataset {dataset_name} as a Custom MCQ dataset. ')
+            return CustomMCQDataset(dataset=dataset_name, **kwargs)
+        else:
+            warnings.warn(f'Will assume unsupported dataset {dataset_name} as a Custom Text MCQ dataset. ')
+            return CustomTextMCQDataset(dataset=dataset_name, **kwargs)
+    else:
+        warnings.warn(f'Will assume unsupported dataset {dataset_name} as a Custom VQA dataset. ')
+        return CustomVQADataset(dataset=dataset_name, **kwargs)
+#---------------------------
                 # Handling Multi-Turn Dataset
                 if dataset.TYPE == 'MT':
                     result_file_base = result_file_base.replace('.xlsx', '.tsv')
